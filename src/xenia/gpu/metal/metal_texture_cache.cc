@@ -12,6 +12,8 @@
 #include "xenia/gpu/metal/metal_heap_pool.h"
 
 #include <algorithm>
+#include <string>
+#include <atomic>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -113,6 +115,22 @@ DEFINE_int32(metal_heap_min_bytes, 33554432,
 namespace xe {
 namespace gpu {
 namespace metal {
+
+// Diagnostic: describes a texture key for texture load failure logs.
+template <typename Key>
+static std::string DescribeTextureKeyForLog(const Key& k) {
+  return fmt::format(
+      "format={} dim={} size={}x{}x{} tiled={} packed_mips={} pitch={} "
+      "mip_max_level={} base_page={:05X} mip_page={:05X} endian={} "
+      "scaled={}",
+      uint32_t(k.format), uint32_t(k.dimension), uint32_t(k.width_minus_1) + 1,
+      uint32_t(k.height_minus_1) + 1,
+      uint32_t(k.depth_or_array_size_minus_1) + 1, uint32_t(k.tiled),
+      uint32_t(k.packed_mips), uint32_t(k.pitch), uint32_t(k.mip_max_level),
+      uint32_t(k.base_page), uint32_t(k.mip_page), uint32_t(k.endianness),
+      uint32_t(k.scaled_resolve));
+}
+
 namespace {
 
 #if XE_PLATFORM_IOS
@@ -813,8 +831,25 @@ MTL::PixelFormat MetalTextureCache::GetPixelFormatForKey(TextureKey key) const {
 bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                                           bool load_mips) {
   SCOPE_profile_cpu_f("gpu");
+  // Diagnostic: report why a texture load failed (rate-limited per exit).
+  auto log_load_fail = [&texture](int line) {
+    static std::mutex fail_mutex;
+    static std::unordered_map<int, uint32_t> fail_counts;
+    uint32_t count;
+    {
+      std::lock_guard<std::mutex> lock(fail_mutex);
+      count = ++fail_counts[line];
+    }
+    if (count > 4 && (count % 256) != 0) {
+      return;
+    }
+    XELOGE(
+        "MetalTexture: GPU load failed at metal_texture_cache.cc:{} (#{}) {}",
+        line, count, DescribeTextureKeyForLog(texture.key()));
+  };
   MetalTexture* metal_texture = static_cast<MetalTexture*>(&texture);
   if (!metal_texture || !metal_texture->metal_texture()) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -841,6 +876,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
 
   const FormatInfo* guest_format_info = FormatInfo::Get(key.format);
   if (!guest_format_info) {
+    log_load_fail(__LINE__);
     return false;
   }
   uint32_t block_width = guest_format_info->block_width;
@@ -850,12 +886,14 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   uint32_t level_first = load_base ? 0 : 1;
   uint32_t level_last = load_mips ? key.mip_max_level : 0;
   if (level_first > level_last) {
+    log_load_fail(__LINE__);
     return false;
   }
 
   bool decompress = IsDecompressionNeededForKey(key);
   TextureCache::LoadShaderIndex load_shader = GetLoadShaderIndexForKey(key);
   if (load_shader == TextureCache::kLoadShaderIndexUnknown) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -864,6 +902,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
           ? load_pipelines_scaled_[static_cast<size_t>(load_shader)]
           : load_pipelines_[static_cast<size_t>(load_shader)];
   if (!pipeline) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -973,18 +1012,22 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
 
   if (stored_levels.empty()) {
+    log_load_fail(__LINE__);
     return false;
   }
   if (dest_buffer_size > SIZE_MAX) {
+    log_load_fail(__LINE__);
     return false;
   }
 
   MTL::Device* device = command_processor_->GetMetalDevice();
   if (!device) {
+    log_load_fail(__LINE__);
     return false;
   }
   MTL::CommandQueue* queue = command_processor_->GetMetalCommandQueue();
   if (!queue) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -992,6 +1035,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
       static_cast<MetalSharedMemory&>(shared_memory());
   MTL::Buffer* shared_buffer = metal_shared_memory.GetBuffer();
   if (!shared_buffer) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -1037,6 +1081,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
 
   MTL::Buffer* dest_buffer = acquire_buffer(size_t(dest_buffer_size));
   if (!dest_buffer) {
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -1049,6 +1094,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   MTL::Buffer* constants_buffer = acquire_buffer(constants_buffer_size);
   if (!constants_buffer) {
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+    log_load_fail(__LINE__);
     return false;
   }
 
@@ -1115,6 +1161,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   if (!cmd) {
     release_buffer_immediate(constants_buffer, constants_buffer_size);
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+    log_load_fail(__LINE__);
     return false;
   }
   bool command_buffer_has_work = false;
@@ -1149,6 +1196,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
   if (!encoder) {
     handle_upload_failure(true);
+    log_load_fail(__LINE__);
     return false;
   }
   encoder->setComputePipelineState(pipeline);
@@ -1190,6 +1238,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
         // buffer), so it must be left without an open encoder.
         encoder->endEncoding();
         handle_upload_failure(false);
+        log_load_fail(__LINE__);
         return false;
       }
       encoder->setBuffer(source_buffer, source_buffer_offset, 2);
@@ -1285,6 +1334,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
       handle_upload_failure(true);
+      log_load_fail(__LINE__);
       return false;
     }
 
@@ -1371,6 +1421,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
           if (!staging_buffer) {
             blit->endEncoding();
             handle_upload_failure(true);
+            log_load_fail(__LINE__);
             return false;
           }
 
@@ -1427,6 +1478,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     if (!dest_data) {
       release_buffer_immediate(constants_buffer, constants_buffer_size);
       release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+      log_load_fail(__LINE__);
       return false;
     }
 
@@ -3495,7 +3547,15 @@ MTL::Texture* MetalTextureCache::MetalTexture::GetOrCreate3DAs2DView(
                                                        texture_2d, false);
     texture_3d_as_2d_->SetForceLoad3DTiling(true);
     if (!texture_cache_.LoadTextureData(*texture_3d_as_2d_)) {
-      XELOGE("MetalTexture: Failed to load 3D-as-2D texture data");
+      {
+        static std::atomic<uint32_t> fail_count{0};
+        uint32_t count = ++fail_count;
+        if (count <= 8 || (count % 64) == 0) {
+          XELOGE(
+              "MetalTexture: Failed to load 3D-as-2D texture data (#{}) {}",
+              count, DescribeTextureKeyForLog(key_2d));
+        }
+      }
       texture_3d_as_2d_.reset();
       return nullptr;
     }

@@ -9,6 +9,11 @@
 
 #include "xenia/gpu/texture_cache.h"
 
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -78,6 +83,22 @@ DEFINE_bool(tiled_shared_memory, true,
 
 namespace xe {
 namespace gpu {
+
+// Diagnostic: describes a texture key for texture load failure logs.
+template <typename Key>
+static std::string DescribeTextureKeyForLog(const Key& k) {
+  return fmt::format(
+      "format={} dim={} size={}x{}x{} tiled={} packed_mips={} pitch={} "
+      "mip_max_level={} base_page={:05X} mip_page={:05X} endian={} "
+      "scaled={}",
+      uint32_t(k.format), uint32_t(k.dimension), uint32_t(k.width_minus_1) + 1,
+      uint32_t(k.height_minus_1) + 1,
+      uint32_t(k.depth_or_array_size_minus_1) + 1, uint32_t(k.tiled),
+      uint32_t(k.packed_mips), uint32_t(k.pitch), uint32_t(k.mip_max_level),
+      uint32_t(k.base_page), uint32_t(k.mip_page), uint32_t(k.endianness),
+      uint32_t(k.scaled_resolve));
+}
+
 
 const TextureCache::LoadShaderInfo
     TextureCache::load_shader_info_[kLoadShaderCount] = {
@@ -714,11 +735,29 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
   if (watch_base &&
       !shared_memory.IsRangeValid(
           key().base_page << 12, xe::align(GetGuestBaseSize(), UINT32_C(16)))) {
+    {
+      static std::atomic<uint32_t> n{0};
+      if (++n <= 8) {
+        XELOGE(
+            "TextureCache: MakeUpToDateAndWatch base range invalid "
+            "(GetGuestBaseSize={}) {}",
+            GetGuestBaseSize(), DescribeTextureKeyForLog(key()));
+      }
+    }
     return false;
   }
   if (watch_mips &&
       !shared_memory.IsRangeValid(
           key().mip_page << 12, xe::align(GetGuestMipsSize(), UINT32_C(16)))) {
+    {
+      static std::atomic<uint32_t> n{0};
+      if (++n <= 8) {
+        XELOGE(
+            "TextureCache: MakeUpToDateAndWatch mips range invalid "
+            "(GetGuestMipsSize={}) {}",
+            GetGuestMipsSize(), DescribeTextureKeyForLog(key()));
+      }
+    }
     return false;
   }
 
@@ -1081,6 +1120,23 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   }
 
   TextureKey texture_key = texture.key();
+  // Diagnostic: report why a texture load failed (rate-limited per exit).
+  auto log_load_fail = [&texture_key](int line, const char* stage) {
+    static std::mutex fail_mutex;
+    static std::unordered_map<int, uint32_t> fail_counts;
+    uint32_t count;
+    {
+      std::lock_guard<std::mutex> lock(fail_mutex);
+      count = ++fail_counts[line];
+    }
+    if (count > 4 && (count % 256) != 0) {
+      return;
+    }
+    XELOGE(
+        "TextureCache: LoadTextureData failed ({}) at texture_cache.cc:{} "
+        "(#{}) {}",
+        stage, line, count, DescribeTextureKeyForLog(texture_key));
+  };
 
   // Implementation may load multiple blocks at once via accesses of up to 128
   // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
@@ -1100,6 +1156,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.base_page << 12,
             xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+      log_load_fail(__LINE__, "RequestRange base");
       return false;
     }
   }
@@ -1107,6 +1164,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.mip_page << 12,
             xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+      log_load_fail(__LINE__, "RequestRange mips");
       return false;
     }
   }
@@ -1117,10 +1175,12 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     // GPU won't be trying to access unmapped memory.
     if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
                                             texture.GetGuestBaseSize(), 4)) {
+      log_load_fail(__LINE__, "scaled resolve base");
       return false;
     }
     if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
                                             texture.GetGuestMipsSize(), 4)) {
+      log_load_fail(__LINE__, "scaled resolve mips");
       return false;
     }
   }
@@ -1128,6 +1188,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // Actually load the texture data.
   if (!LoadTextureDataFromResidentMemoryImpl(texture, base_outdated,
                                              mips_outdated)) {
+    log_load_fail(__LINE__, "LoadTextureDataFromResidentMemoryImpl");
     return false;
   }
 
@@ -1136,6 +1197,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+    log_load_fail(__LINE__, "MakeUpToDateAndWatch");
     return false;
   }
 
