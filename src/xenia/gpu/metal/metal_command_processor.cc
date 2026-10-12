@@ -67,6 +67,13 @@
 DECLARE_bool(precise_interpolation);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(submit_on_primary_buffer_end);
+DEFINE_bool(
+    metal_debug_sync_after_draw, false,
+    "Debugging only, extremely slow: submit and wait for the GPU after every "
+    "draw so each draw sees guest memory exactly as it was when issued. If "
+    "this fixes wrong or misplaced geometry, the cause is guest memory being "
+    "rewritten before the GPU executes earlier draws.",
+    "Metal");
 DEFINE_int32(
     metal_draw_ring_count, 128,
     "Metal per-command-buffer draw ring size (descriptor-table pages). "
@@ -3108,9 +3115,14 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   if (UseDxilPath()) {
-    return IssueDrawDxil(vertex_shader, pixel_shader,
-                         primitive_processing_result, primitive_polygonal,
-                         memexport_used, normalized_color_mask, regs);
+    bool draw_ok =
+        IssueDrawDxil(vertex_shader, pixel_shader, primitive_processing_result,
+                      primitive_polygonal, memexport_used,
+                      normalized_color_mask, regs);
+    if (draw_ok && ::cvars::metal_debug_sync_after_draw) {
+      AwaitAllQueueOperationsCompletion();
+    }
+    return draw_ok;
   }
 
   if (!EnsureSpirvUniformBufferCapacity()) {
