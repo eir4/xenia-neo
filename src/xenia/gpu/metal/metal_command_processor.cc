@@ -23,7 +23,10 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -87,6 +90,24 @@ DEFINE_int32(
 namespace xe {
 namespace gpu {
 namespace metal {
+
+namespace {
+// Diagnostic: counts draws dropped without being issued, per reason, so
+// missing geometry can be attributed. Logs the first few of each reason and
+// then every 512th.
+void LogDrawSkip(const char* reason) {
+  static std::mutex skip_mutex;
+  static std::unordered_map<std::string, uint32_t> skip_counts;
+  uint32_t count;
+  {
+    std::lock_guard<std::mutex> lock(skip_mutex);
+    count = ++skip_counts[reason];
+  }
+  if (count <= 4 || (count % 512) == 0) {
+    XELOGW("Metal: draw skipped: {} (#{})", reason, count);
+  }
+}
+}  // namespace
 
 namespace {
 // Guest shaders go SPIR-V -> DXIL -> AIR instead of SPIR-V -> MSL. Both start
@@ -2966,6 +2987,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   Shader* vertex_shader = active_vertex_shader();
   if (!vertex_shader) {
     XELOGW("IssueDraw: No vertex shader");
+    LogDrawSkip("no vertex shader");
     return false;
   }
   if (!vertex_shader->is_ucode_analyzed()) {
@@ -3019,6 +3041,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     return false;
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
+    LogDrawSkip("primitive processor produced zero host vertices");
     return true;
   }
   if (primitive_processing_result.host_vertex_shader_type ==
@@ -3037,6 +3060,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             "Metal: skipping tessellated draws, mesh shaders are not supported "
             "on this device");
       }
+      LogDrawSkip("tessellated draw, no mesh shader support");
       return true;
     }
     if (!pixel_shader) {
@@ -3065,6 +3089,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       XELOGE(
           "MetalCommandProcessor::IssueDraw - RenderTargetCache::Update "
           "failed");
+      LogDrawSkip("RenderTargetCache::Update failed");
       return false;
     }
   }
@@ -4851,6 +4876,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
                 (!is_tessellated || cvars::async_shader_skip_draws),
             &pixel_status));
     if (pixel_status == ShaderCompileStatus::kFailed) {
+      LogDrawSkip("DXIL: pixel shader failed");
       return false;
     }
   }
@@ -4863,6 +4889,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
   bool bound_placeholder = false;
   if (is_tessellated) {
     if (!EnsureTessellatorTablesBuffer()) {
+      LogDrawSkip("DXIL: tessellator tables unavailable");
       return false;
     }
     // GetDxilTessellationShaders owns this translation. Kept here for the logs.
@@ -4873,6 +4900,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
     // vertex-only placeholder can't stand in for its pixel shader.
     if (pixel_status != ShaderCompileStatus::kReady) {
       LogShaderCompilePending(pixel_translation, "pixel");
+      LogDrawSkip("DXIL: tessellated draw, pixel shader pending");
       return true;
     }
     tessellation_shaders = GetDxilTessellationShaders(
@@ -4891,8 +4919,10 @@ bool MetalCommandProcessor::IssueDrawDxil(
     if (!tessellation_shaders) {
       if (compile_status == ShaderCompileStatus::kPending) {
         LogShaderCompilePending(domain_translation, "tessellation");
+        LogDrawSkip("DXIL: tessellation shaders pending");
         return true;
       }
+      LogDrawSkip("DXIL: tessellation shaders failed");
       return false;
     }
     PipelineCompileStatus tess_pipeline_status = PipelineCompileStatus::kReady;
@@ -4912,8 +4942,10 @@ bool MetalCommandProcessor::IssueDrawDxil(
     if (!pipeline) {
       if (tess_pipeline_status == PipelineCompileStatus::kPending) {
         LogPipelineCompilePending(domain_translation, pixel_translation);
+        LogDrawSkip("DXIL: tessellation pipeline pending");
         return true;
       }
+      LogDrawSkip("DXIL: tessellation pipeline failed");
       return false;
     }
   } else {
@@ -4925,9 +4957,11 @@ bool MetalCommandProcessor::IssueDrawDxil(
     // Nothing can stand in for the vertex shader, so its draws wait.
     if (compile_status == ShaderCompileStatus::kPending) {
       LogShaderCompilePending(vertex_translation, "vertex");
+      LogDrawSkip("DXIL: vertex shader pending");
       return true;
     }
     if (compile_status != ShaderCompileStatus::kReady) {
+      LogDrawSkip("DXIL: vertex shader failed");
       return false;
     }
     PipelineCompileStatus pipeline_compile_status =
@@ -4956,8 +4990,10 @@ bool MetalCommandProcessor::IssueDrawDxil(
       if (pipeline_compile_status == PipelineCompileStatus::kPending ||
           pixel_status != ShaderCompileStatus::kReady) {
         LogPipelineCompilePending(vertex_translation, pixel_translation);
+        LogDrawSkip("DXIL: pipeline pending, no placeholder");
         return true;
       }
+      LogDrawSkip("DXIL: pipeline creation failed");
       return false;
     }
   }
@@ -4975,10 +5011,12 @@ bool MetalCommandProcessor::IssueDrawDxil(
         bind_pixel_shader->GetUsedTextureMaskAfterTranslation();
   }
   if (!PrepareDrawTextures(used_texture_mask, regs)) {
+    LogDrawSkip("DXIL: PrepareDrawTextures failed");
     return true;
   }
 
   if (!RequestDrawSharedMemoryRanges(*dxil_vertex_shader, regs)) {
+    LogDrawSkip("DXIL: RequestDrawSharedMemoryRanges failed");
     return false;
   }
 
@@ -5040,6 +5078,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
   if (!dxil_binder_.Bind(current_render_encoder_, dxil_vertex_shader,
                          bind_pixel_shader, constants, memexport_used,
                          is_tessellated)) {
+    LogDrawSkip("DXIL: argument buffer binding failed");
     return false;
   }
 
@@ -5047,6 +5086,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
   if (!ResolveDrawIndexBuffer(primitive_processing_result,
                               host_vertex_shader_type, is_tessellated,
                               draw_index_buffer)) {
+    LogDrawSkip("DXIL: ResolveDrawIndexBuffer failed");
     return false;
   }
 

@@ -106,6 +106,40 @@ constexpr char kGeometryKeyY[] = "/window/y";
 constexpr char kGeometryKeyMaximized[] = "/window/maximized";
 }  // namespace
 
+// Moves the frame so its title bar and as much of it as fits are on the
+// display it mostly overlaps (or the primary one), e.g. when a saved position
+// or a resize left the top border above the screen.
+static void KeepFrameOnScreen(wxFrame* frame) {
+  if (!frame || frame->IsMaximized() || frame->IsFullScreen()) {
+    return;
+  }
+  int display_index = wxDisplay::GetFromWindow(frame);
+  if (display_index == wxNOT_FOUND) {
+    display_index = 0;
+  }
+  wxDisplay display(static_cast<unsigned int>(display_index));
+  wxRect area = display.GetClientArea();
+  wxRect rect = frame->GetRect();
+  int x = rect.x;
+  int y = rect.y;
+  if (rect.GetBottom() > area.GetBottom()) {
+    y = area.GetBottom() - rect.height + 1;
+  }
+  if (rect.GetRight() > area.GetRight()) {
+    x = area.GetRight() - rect.width + 1;
+  }
+  // The top-left corner wins if the frame is larger than the display.
+  if (y < area.y) {
+    y = area.y;
+  }
+  if (x < area.x) {
+    x = area.x;
+  }
+  if (x != rect.x || y != rect.y) {
+    frame->Move(x, y);
+  }
+}
+
 static wxPoint ReadInitialFramePositionFromConfig() {
   auto* config = wxConfigBase::Get();
   if (!config) {
@@ -388,6 +422,7 @@ bool WxWindow::OpenImpl() {
   frame_->EnableFullScreenView(true);
 #endif
 
+  KeepFrameOnScreen(frame_);
   frame_->Show(true);
   render_target()->SetFocus();
 
@@ -445,6 +480,7 @@ void WxWindow::EnsureInitialRenderSurfaceSize() {
   int new_client_h = int(target_h) + (client_size.y - render_size.y);
   if (new_client_w != client_size.x || new_client_h != client_size.y) {
     frame_->SetClientSize(new_client_w, new_client_h);
+    KeepFrameOnScreen(frame_);
   }
 }
 
