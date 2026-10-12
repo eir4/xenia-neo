@@ -1079,6 +1079,8 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     // reque for makeuptodatandwatch
     textures[i] = &texture;
   }
+  Texture* needs_reload[64];
+  uint32_t n_needs_reload = 0;
   {
     auto crit = global_critical_region_.Acquire();
 
@@ -1092,11 +1094,17 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       // regular texture or a vertex buffer, and thus the scaled resolve version
       // is not up to date anymore.
       if (!texture->MakeUpToDateAndWatch(crit)) {
+        // Invalidated by the guest during the batch - collect for a full
+        // reload (with retries) after the lock is released.
+        needs_reload[n_needs_reload++] = texture;
         continue;
       }
 
       texture->LogAction("Loaded");
     }
+  }
+  for (uint32_t i = 0; i < n_needs_reload; ++i) {
+    LoadTextureData(*needs_reload[i]);
   }
 }
 bool TextureCache::LoadTextureData(Texture& texture) {
@@ -1196,7 +1204,49 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
-  if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+  bool watched =
+      texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  // The guest may have modified the pages between the upload and the watch
+  // installation (invalidating them), in which case the texture would be left
+  // outdated with data possibly torn mid-write. Re-request and reload a few
+  // times so the texture ends up consistent instead of waiting for a later
+  // frame.
+  constexpr uint32_t kMaxReloadAttempts = 3;
+  uint32_t reload_attempts = 0;
+  while (!watched && reload_attempts < kMaxReloadAttempts) {
+    ++reload_attempts;
+    if (base_outdated &&
+        !shared_memory().RequestRange(
+            texture_key.base_page << 12,
+            xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+      break;
+    }
+    if (mips_outdated &&
+        !shared_memory().RequestRange(
+            texture_key.mip_page << 12,
+            xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+      break;
+    }
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, base_outdated,
+                                               mips_outdated)) {
+      break;
+    }
+    watched = texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  }
+  if (reload_attempts) {
+    static std::atomic<uint32_t> retry_total{0};
+    static std::atomic<uint32_t> retry_ok{0};
+    uint32_t total = ++retry_total;
+    uint32_t ok = retry_ok += watched ? 1 : 0;
+    if (total <= 16 || (total % 256) == 0) {
+      XELOGE(
+          "TextureCache: reload after invalidation {} after {} attempt(s) "
+          "(retries so far: {}, succeeded: {}) {}",
+          watched ? "succeeded" : "FAILED", reload_attempts, total, ok,
+          DescribeTextureKeyForLog(texture_key));
+    }
+  }
+  if (!watched) {
     log_load_fail(__LINE__, "MakeUpToDateAndWatch");
     return false;
   }
