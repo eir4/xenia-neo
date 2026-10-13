@@ -2733,6 +2733,7 @@ void MetalCommandProcessor::WaitForGpuBeforeSharedMemoryOverwrite() {
   AwaitAllQueueOperationsCompletion();
   if (had_open_command_buffer) {
     BeginCommandBuffer();
+    shared_memory_wait_replaced_encoder_ = true;
   }
 }
 
@@ -3131,10 +3132,25 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   if (UseDxilPath()) {
-    bool draw_ok =
-        IssueDrawDxil(vertex_shader, pixel_shader, primitive_processing_result,
-                      primitive_polygonal, memexport_used,
-                      normalized_color_mask, regs);
+    bool draw_ok = true;
+    for (uint32_t attempt = 0; attempt < 3; ++attempt) {
+      draw_needs_retry_ = false;
+      if (!current_command_buffer_ || !current_render_encoder_) {
+        LogDrawSkip("no render encoder after a GPU wait");
+        draw_needs_retry_ = false;
+        return true;
+      }
+      draw_ok = IssueDrawDxil(vertex_shader, pixel_shader,
+                              primitive_processing_result, primitive_polygonal,
+                              memexport_used, normalized_color_mask, regs);
+      if (!draw_needs_retry_) {
+        break;
+      }
+    }
+    if (draw_needs_retry_) {
+      draw_needs_retry_ = false;
+      LogDrawSkip("DXIL: encoder kept being replaced by GPU waits");
+    }
     if (draw_ok && ::cvars::metal_debug_sync_after_draw) {
       AwaitAllQueueOperationsCompletion();
     }
@@ -3147,9 +3163,27 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         "draw");
     return true;
   }
-  return IssueDrawMsl(vertex_shader, pixel_shader, primitive_processing_result,
-                      primitive_polygonal, is_rasterization_done,
-                      memexport_used, normalized_color_mask, regs);
+  bool msl_draw_ok = true;
+  for (uint32_t attempt = 0; attempt < 3; ++attempt) {
+    draw_needs_retry_ = false;
+    if (!current_command_buffer_ || !current_render_encoder_) {
+      LogDrawSkip("no render encoder after a GPU wait");
+      draw_needs_retry_ = false;
+      return true;
+    }
+    msl_draw_ok = IssueDrawMsl(vertex_shader, pixel_shader,
+                               primitive_processing_result, primitive_polygonal,
+                               is_rasterization_done, memexport_used,
+                               normalized_color_mask, regs);
+    if (!draw_needs_retry_) {
+      break;
+    }
+  }
+  if (draw_needs_retry_) {
+    draw_needs_retry_ = false;
+    LogDrawSkip("MSL: encoder kept being replaced by GPU waits");
+  }
+  return msl_draw_ok;
 }
 
 bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
@@ -3771,6 +3805,7 @@ bool MetalCommandProcessor::IssueDrawMsl(
   draw_util::ViewportInfo viewport_info;
   ComputeDrawViewportInfo(regs, msl_pixel_shader, normalized_depth_control,
                           viewport_info);
+  shared_memory_wait_replaced_encoder_ = false;
   ApplyViewportAndScissor(regs, viewport_info);
 
   // Apply fixed-function state.
@@ -4376,6 +4411,15 @@ bool MetalCommandProcessor::IssueDrawMsl(
   if (!pixel_uses_argbuf) {
     bind_msl_textures(bind_pixel_shader, bind_pixel_translation, true);
     bind_msl_samplers(bind_pixel_shader, bind_pixel_translation, true);
+  }
+
+  // An upload while binding resources (for example a 3D-as-2D texture load)
+  // may have waited for the GPU, which replaced the encoder this draw's state
+  // was set on. Draw again from the start on the new encoder.
+  if (shared_memory_wait_replaced_encoder_) {
+    shared_memory_wait_replaced_encoder_ = false;
+    draw_needs_retry_ = true;
+    return true;
   }
 
   // Resume a ZPD segment waiting on a render encoder so this draw is counted.
@@ -5084,6 +5128,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
   draw_util::ViewportInfo viewport_info;
   ComputeDrawViewportInfo(regs, dxil_pixel_shader, normalized_depth_control,
                           viewport_info);
+  shared_memory_wait_replaced_encoder_ = false;
   ApplyViewportAndScissor(regs, viewport_info);
 
   if (msl_bound_pipeline_state_ != pipeline) {
@@ -5149,6 +5194,15 @@ bool MetalCommandProcessor::IssueDrawDxil(
                               draw_index_buffer)) {
     LogDrawSkip("DXIL: ResolveDrawIndexBuffer failed");
     return false;
+  }
+
+  // An upload while binding resources (for example a 3D-as-2D texture load)
+  // may have waited for the GPU, which replaced the encoder this draw's state
+  // was set on. Draw again from the start on the new encoder.
+  if (shared_memory_wait_replaced_encoder_) {
+    shared_memory_wait_replaced_encoder_ = false;
+    draw_needs_retry_ = true;
+    return true;
   }
 
   // Resume a ZPD segment waiting on a render encoder so this draw is counted.

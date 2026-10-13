@@ -907,6 +907,11 @@ class MetalCommandProcessor : public CommandProcessor {
   // Shared memory ranges the draw being issued reads, recorded in the shared
   // memory's GPU-use tracking once the draw is encoded.
   std::vector<std::pair<uint32_t, uint32_t>> draw_gpu_read_ranges_;
+  // Set when a shared memory upload waited for the GPU and reopened the command
+  // buffer, so the encoder a draw's state was set on is gone; the draw then
+  // asks to be issued again.
+  bool shared_memory_wait_replaced_encoder_ = false;
+  bool draw_needs_retry_ = false;
   uint64_t submission_completed_processed_ = 0;
   // Signaled by the submission completion handler so waits for a specific
   // submission don't have to poll.
