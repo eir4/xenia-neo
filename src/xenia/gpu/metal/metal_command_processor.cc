@@ -67,6 +67,15 @@
 DECLARE_bool(precise_interpolation);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(submit_on_primary_buffer_end);
+DEFINE_string(
+    metal_capture_dir, "capture",
+    "Directory for draw captures. Create an empty file named CAPTURE in it "
+    "while the game runs to capture the next metal_capture_frames frames.",
+    "Metal");
+DEFINE_int32(metal_capture_frames, 2,
+             "Number of frames recorded per draw capture.", "Metal");
+DEFINE_bool(metal_capture_on_start, false,
+            "Start a draw capture on the first frame after launch.", "Metal");
 DEFINE_int32(
     metal_perf_log_seconds, 5,
     "Log a line with frames per second, draw issue time, time blocked waiting "
@@ -2393,12 +2402,207 @@ void MetalCommandProcessor::InitializeShaderStorage(
   }
 }
 
+namespace {
+void CaptureWriteFile(const std::string& path, const void* data,
+                      size_t size) {
+  FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    return;
+  }
+  if (size) {
+    std::fwrite(data, 1, size, file);
+  }
+  std::fclose(file);
+}
+}  // namespace
+
+void MetalCommandProcessor::CaptureUpdateOnSwap() {
+  if (capture_frames_left_ > 0) {
+    ++capture_frame_;
+    capture_draw_ = 0;
+    if (--capture_frames_left_ == 0) {
+      XELOGI("Metal capture: finished, written to {}", capture_path_);
+    }
+  }
+  ++capture_swap_count_;
+  if (capture_frames_left_ > 0) {
+    return;
+  }
+  bool start = false;
+  if (::cvars::metal_capture_on_start && !capture_started_on_start_ &&
+      capture_swap_count_ > 60) {
+    capture_started_on_start_ = true;
+    start = true;
+  } else if (capture_swap_count_ % 10 == 0) {
+    std::error_code ec;
+    std::filesystem::path trigger =
+        std::filesystem::path(::cvars::metal_capture_dir) / "CAPTURE";
+    if (std::filesystem::exists(trigger, ec)) {
+      std::filesystem::remove(trigger, ec);
+      start = true;
+    }
+  }
+  if (!start) {
+    return;
+  }
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  capture_path_ =
+      (std::filesystem::path(::cvars::metal_capture_dir) /
+       fmt::format("cap_{}", std::chrono::duration_cast<std::chrono::seconds>(
+                                 now)
+                                 .count()))
+          .string();
+  std::error_code ec;
+  std::filesystem::create_directories(capture_path_, ec);
+  capture_frames_left_ = std::max(1, ::cvars::metal_capture_frames);
+  capture_frame_ = 0;
+  capture_draw_ = 0;
+  capture_shaders_written_.clear();
+  XELOGI("Metal capture: recording {} frame(s) to {}", capture_frames_left_,
+         capture_path_);
+}
+
+void MetalCommandProcessor::CaptureDraw(
+    xenos::PrimitiveType primitive_type, uint32_t index_count,
+    const IndexBufferInfo* index_buffer_info, const Shader& vertex_shader,
+    const Shader* pixel_shader) {
+  if (capture_frames_left_ <= 0 || !memory_) {
+    return;
+  }
+  const RegisterFile& regs = *register_file_;
+  const std::string base =
+      fmt::format("{}/f{}_d{:05}", capture_path_, capture_frame_, capture_draw_);
+  ++capture_draw_;
+
+  // Shader microcode and disassembly, once per shader.
+  auto write_shader = [&](const Shader& shader) {
+    uint64_t hash = shader.ucode_data_hash();
+    if (!capture_shaders_written_.insert(hash).second) {
+      return;
+    }
+    std::string prefix = fmt::format(
+        "{}/shader_{}_{:016X}", capture_path_,
+        shader.type() == xenos::ShaderType::kVertex ? "vs" : "ps", hash);
+    CaptureWriteFile(prefix + ".bin", shader.ucode_data().data(),
+                     shader.ucode_data().size() * sizeof(uint32_t));
+    const std::string& disasm = shader.ucode_disassembly();
+    CaptureWriteFile(prefix + ".txt", disasm.data(), disasm.size());
+  };
+  write_shader(vertex_shader);
+  if (pixel_shader) {
+    write_shader(*pixel_shader);
+  }
+
+  const Shader::ConstantRegisterMap& cmap = vertex_shader.constant_register_map();
+
+  // Vertex shader float constants (bone matrices etc.), 256 vec4.
+  CaptureWriteFile(
+      base + "_vsconst.bin",
+      &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 256 * 4 * sizeof(float));
+
+  std::string json = "{\n";
+  json += fmt::format("  \"frame\": {},\n  \"draw\": {},\n", capture_frame_,
+                      capture_draw_ - 1);
+  json += fmt::format("  \"primitive_type\": {},\n  \"index_count\": {},\n",
+                      uint32_t(primitive_type), index_count);
+  json += fmt::format("  \"vs_hash\": \"{:016X}\",\n", vertex_shader.ucode_data_hash());
+  json += fmt::format("  \"ps_hash\": \"{:016X}\",\n",
+                      pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+  json += fmt::format("  \"vs_float_dynamic_addressing\": {},\n",
+                      cmap.float_dynamic_addressing ? "true" : "false");
+  json += fmt::format("  \"vs_float_count\": {},\n", cmap.float_count);
+  json += "  \"vs_float_used\": [";
+  bool first = true;
+  for (uint32_t i = 0; i < 256; ++i) {
+    if (cmap.float_dynamic_addressing ||
+        (cmap.float_bitmap[i / 64] & (uint64_t(1) << (i % 64)))) {
+      json += fmt::format("{}{}", first ? "" : ",", i);
+      first = false;
+    }
+  }
+  json += "],\n";
+
+  // Vertex streams, raw from guest memory.
+  json += "  \"vertex_fetches\": [";
+  first = true;
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint32_t bits = cmap.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (xe::bit_scan_forward(bits, &j)) {
+      bits &= ~(uint32_t(1) << j);
+      uint32_t index = i * 32 + j;
+      xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(index);
+      uint32_t offset = xenos::CpuToGpu(vfetch.address << 2);
+      uint32_t length = vfetch.size << 2;
+      bool dumped = false;
+      if (length && length <= 64u * 1024 * 1024 &&
+          offset <= SharedMemory::kBufferSize &&
+          SharedMemory::kBufferSize - offset >= length) {
+        const uint8_t* src = memory_->TranslatePhysical(offset);
+        if (src) {
+          CaptureWriteFile(fmt::format("{}_vb{}.bin", base, index), src, length);
+          dumped = true;
+        }
+      }
+      json += fmt::format(
+          "{}\n    {{\"index\": {}, \"address\": {}, \"size_bytes\": {}, "
+          "\"endian\": {}, \"dumped\": {}}}",
+          first ? "" : ",", index, offset, length, uint32_t(vfetch.endian),
+          dumped ? "true" : "false");
+      first = false;
+    }
+  }
+  json += "\n  ],\n";
+
+  // Index buffer.
+  if (index_buffer_info && index_buffer_info->length) {
+    uint32_t offset = index_buffer_info->guest_base;
+    size_t length = index_buffer_info->length;
+    bool dumped = false;
+    if (length <= 64u * 1024 * 1024 && offset <= SharedMemory::kBufferSize &&
+        SharedMemory::kBufferSize - offset >= length) {
+      const uint8_t* src = memory_->TranslatePhysical(offset);
+      if (src) {
+        CaptureWriteFile(base + "_ib.bin", src, length);
+        dumped = true;
+      }
+    }
+    json += fmt::format(
+        "  \"index_buffer\": {{\"address\": {}, \"size_bytes\": {}, "
+        "\"format\": {}, \"endian\": {}, \"dumped\": {}}},\n",
+        offset, length, uint32_t(index_buffer_info->format),
+        uint32_t(index_buffer_info->endianness), dumped ? "true" : "false");
+  } else {
+    json += "  \"index_buffer\": null,\n";
+  }
+
+  // Texture fetch constants (raw 6 dwords) used by the pixel shader.
+  json += "  \"textures\": [";
+  first = true;
+  if (pixel_shader) {
+    for (const auto& binding : pixel_shader->texture_bindings()) {
+      xenos::xe_gpu_texture_fetch_t fetch =
+          regs.GetTextureFetch(binding.fetch_constant);
+      json += fmt::format(
+          "{}\n    {{\"fetch_constant\": {}, \"dwords\": [{}, {}, {}, {}, {}, "
+          "{}]}}",
+          first ? "" : ",", binding.fetch_constant, fetch.dword_0,
+          fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+          fetch.dword_5);
+      first = false;
+    }
+  }
+  json += "\n  ]\n}\n";
+  CaptureWriteFile(base + ".json", json.data(), json.size());
+}
+
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   EndZPDFrame();
   ProcessCompletedSubmissions();
+  CaptureUpdateOnSwap();
 
   ++perf_window_.frames;
   if (::cvars::metal_perf_log_seconds > 0) {
@@ -3128,6 +3332,8 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     primitive_processing_result.host_vertex_shader_type =
         Shader::HostVertexShaderType::kVertex;
   }
+  CaptureDraw(primitive_type, index_count, index_buffer_info, *vertex_shader,
+              pixel_shader);
 
   if (primitive_processing_result.IsTessellated()) {
     // The DXIL path tessellates through MSC's object/mesh emulation.

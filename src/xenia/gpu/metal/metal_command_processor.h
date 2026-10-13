@@ -926,6 +926,20 @@ class MetalCommandProcessor : public CommandProcessor {
     uint64_t gpu_busy_ns_start = 0;
   };
   PerfWindow perf_window_;
+
+  // Draw capture (metal_capture_dir). Dumps per-draw shader, constant, vertex,
+  // index and texture fetch data for offline use.
+  void CaptureUpdateOnSwap();
+  void CaptureDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                   const IndexBufferInfo* index_buffer_info,
+                   const Shader& vertex_shader, const Shader* pixel_shader);
+  int32_t capture_frames_left_ = 0;
+  uint32_t capture_frame_ = 0;
+  uint32_t capture_draw_ = 0;
+  uint32_t capture_swap_count_ = 0;
+  bool capture_started_on_start_ = false;
+  std::string capture_path_;
+  std::unordered_set<uint64_t> capture_shaders_written_;
   uint64_t submission_completed_processed_ = 0;
   // Signaled by the submission completion handler so waits for a specific
   // submission don't have to poll.
