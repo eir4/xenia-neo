@@ -9,6 +9,8 @@
 
 #ifndef XENIA_GPU_GPU_FLAGS_H_
 #define XENIA_GPU_GPU_FLAGS_H_
+#include <atomic>
+
 #include "xenia/base/cvar.h"
 
 DECLARE_path(trace_gpu_prefix);
@@ -91,5 +93,12 @@ DECLARE_bool(mulsc_round_toward_zero);
 DECLARE_bool(xenos_sample_positions);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
+
+namespace xe {
+namespace gpu {
+// Set by the UI (toolbar Capture button) to record the next frames' draws.
+extern std::atomic<bool> g_draw_capture_requested;
+}  // namespace gpu
+}  // namespace xe
 
 #endif  // XENIA_GPU_GPU_FLAGS_H_

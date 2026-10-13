@@ -13,6 +13,12 @@
 #include "xenia/base/platform.h"
 #include "xenia/ui/renderdoc_api.h"
 
+namespace xe {
+namespace gpu {
+std::atomic<bool> g_draw_capture_requested{false};
+}  // namespace gpu
+}  // namespace xe
+
 // Unified-memory hosts (Apple Silicon, Windows on ARM) benefit from aliasing
 // guest RAM directly. x86-64 hosts are overwhelmingly discrete, where it is
 // slow, so default off there.

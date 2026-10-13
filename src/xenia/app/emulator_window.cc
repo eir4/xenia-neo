@@ -28,6 +28,8 @@
 #include <thread>
 
 #include <wx/timer.h>
+#include <algorithm>
+#include <cmath>
 
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
@@ -126,6 +128,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -412,6 +415,7 @@ void StripGameModeFromLdPreload() {
 constexpr int kToolIdOpenBack = 11000;
 constexpr int kToolIdSettings = 11001;
 constexpr int kToolIdProfile = 11002;
+constexpr int kToolIdCapture = 11003;
 // Controller tools occupy 11010..11013 (one per guest slot).
 constexpr int kToolIdControllerBase = 11010;
 constexpr int kToolbarIconSize = 32;
@@ -1147,6 +1151,33 @@ bool EmulatorWindow::Initialize() {
                       ui::embedded_icons::icons8_settings_96_png_size);
       toolbar->AddTool(kToolIdSettings, _("Settings"), settings_bundle,
                        _("Settings"));
+      {
+        // Record-style icon (ring + dot), drawn here so no asset is needed.
+        const int size = kToolbarIconSize;
+        wxImage image(size, size);
+        image.InitAlpha();
+        unsigned char* rgb = image.GetData();
+        unsigned char* alpha = image.GetAlpha();
+        const double center = (size - 1) * 0.5;
+        for (int y = 0; y < size; ++y) {
+          for (int x = 0; x < size; ++x) {
+            double d = std::hypot(x - center, y - center);
+            double a_ring = std::clamp(1.5 - std::fabs(d - 13.0), 0.0, 1.0);
+            double a_dot = std::clamp(8.0 - d, 0.0, 1.0);
+            double a = std::max(a_ring, a_dot);
+            int i = y * size + x;
+            rgb[i * 3] = 230;
+            rgb[i * 3 + 1] = 60;
+            rgb[i * 3 + 2] = 60;
+            alpha[i] = static_cast<unsigned char>(a * 255.0);
+          }
+        }
+        toolbar->AddTool(kToolIdCapture, _("Capture"),
+                         wxBitmapBundle::FromBitmap(wxBitmap(image)),
+                         _("Capture the next 2 frames (draws, bone matrices, "
+                           "vertex data) to Documents/Xenia-neo-Captures"));
+        toolbar->EnableTool(kToolIdCapture, false);
+      }
       wx_toolbar_state_->audio_no_bundle = load_bundle(
           ui::embedded_icons::icons8_no_audio_96_png_data,
           ui::embedded_icons::icons8_no_audio_96_png_size, kAudioIconSize);
@@ -1274,6 +1305,12 @@ bool EmulatorWindow::Initialize() {
             }
           },
           kToolIdOpenBack);
+      frame->Bind(
+          wxEVT_TOOL,
+          [](wxCommandEvent&) {
+            gpu::g_draw_capture_requested.store(true);
+          },
+          kToolIdCapture);
       frame->Bind(
           wxEVT_TOOL,
           [this](wxCommandEvent&) {
@@ -2074,6 +2111,7 @@ void EmulatorWindow::ApplyContentVisibility() {
       tb->SetToolShortHelp(kToolIdSettings,
                            title_open ? _("Guide") : _("Settings"));
     }
+    tb->EnableTool(kToolIdCapture, title_open);
     RefreshAudioIcon();
     tb->Refresh();
   }

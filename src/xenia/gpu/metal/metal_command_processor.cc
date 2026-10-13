@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -68,9 +69,10 @@ DECLARE_bool(precise_interpolation);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(submit_on_primary_buffer_end);
 DEFINE_string(
-    metal_capture_dir, "capture",
-    "Directory for draw captures. Create an empty file named CAPTURE in it "
-    "while the game runs to capture the next metal_capture_frames frames.",
+    metal_capture_dir, "",
+    "Directory for draw captures; each capture gets a date/time subfolder. "
+    "Empty uses ~/Documents/Xenia-neo-Captures. Start a capture with the "
+    "toolbar Capture button while a game runs.",
     "Metal");
 DEFINE_int32(metal_capture_frames, 2,
              "Number of frames recorded per draw capture.", "Metal");
@@ -2433,27 +2435,33 @@ void MetalCommandProcessor::CaptureUpdateOnSwap() {
       capture_swap_count_ > 60) {
     capture_started_on_start_ = true;
     start = true;
-  } else if (capture_swap_count_ % 10 == 0) {
-    std::error_code ec;
-    std::filesystem::path trigger =
-        std::filesystem::path(::cvars::metal_capture_dir) / "CAPTURE";
-    if (std::filesystem::exists(trigger, ec)) {
-      std::filesystem::remove(trigger, ec);
-      start = true;
-    }
+  } else if (g_draw_capture_requested.exchange(false)) {
+    start = true;
   }
   if (!start) {
     return;
   }
-  auto now = std::chrono::system_clock::now().time_since_epoch();
-  capture_path_ =
-      (std::filesystem::path(::cvars::metal_capture_dir) /
-       fmt::format("cap_{}", std::chrono::duration_cast<std::chrono::seconds>(
-                                 now)
-                                 .count()))
-          .string();
+  std::filesystem::path root;
+  if (::cvars::metal_capture_dir.empty()) {
+    const char* home = std::getenv("HOME");
+    root = std::filesystem::path(home ? home : ".") / "Documents" /
+           "Xenia-neo-Captures";
+  } else {
+    root = std::filesystem::path(::cvars::metal_capture_dir);
+  }
+  const std::time_t now_time = std::time(nullptr);
+  std::tm now_tm{};
+  localtime_r(&now_time, &now_tm);
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &now_tm);
   std::error_code ec;
+  capture_path_ = (root / stamp).string();
   std::filesystem::create_directories(capture_path_, ec);
+  if (ec) {
+    XELOGE("Metal capture: could not create {}: {}", capture_path_,
+           ec.message());
+    return;
+  }
   capture_frames_left_ = std::max(1, ::cvars::metal_capture_frames);
   capture_frame_ = 0;
   capture_draw_ = 0;
