@@ -68,10 +68,11 @@ class MetalCommandProcessor : public CommandProcessor {
                                  kernel::KernelState* kernel_state);
   ~MetalCommandProcessor();
 
-  // Submits the open command buffer, waits for the GPU to finish everything
-  // queued, and reopens a command buffer if one was open, so shared memory
-  // contents that queued draws read can be overwritten.
-  void WaitForGpuBeforeSharedMemoryOverwrite();
+  // Waits until the GPU has finished the given submission, so shared memory
+  // its draws read can be overwritten. If that is the still open command
+  // buffer, it is submitted first and a new one is opened. Returns whether it
+  // had to block.
+  bool WaitForGpuBeforeSharedMemoryOverwrite(uint64_t last_use_submission);
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
   void RestoreEdramSnapshot(const void* snapshot) override;

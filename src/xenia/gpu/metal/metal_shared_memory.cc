@@ -98,8 +98,8 @@ bool MetalSharedMemory::Initialize() {
     XELOGD("Metal shared memory: skipping initial copy (zero-copy)");
   }
 
-  gpu_used_pages_.assign(
-      (size_t(kBufferSize >> page_size_log2()) + 63) / 64, 0);
+  gpu_last_used_submission_.assign(size_t(kBufferSize >> page_size_log2()),
+                                   0);
   gpu_used_any_ = false;
   XELOGI("Metal shared memory: {} uploads",
          use_zero_copy_ ? "zero-copy aliased (unordered)"
@@ -108,7 +108,8 @@ bool MetalSharedMemory::Initialize() {
   return true;
 }
 
-void MetalSharedMemory::MarkRangeUsedByGpu(uint32_t start, uint32_t length) {
+void MetalSharedMemory::MarkRangeUsedByGpu(uint32_t start, uint32_t length,
+                                           uint64_t submission) {
   if (use_zero_copy_ || !length || start >= kBufferSize) {
     return;
   }
@@ -116,30 +117,24 @@ void MetalSharedMemory::MarkRangeUsedByGpu(uint32_t start, uint32_t length) {
   uint32_t page_first = start >> page_size_log2();
   uint32_t page_last = (start + length - 1) >> page_size_log2();
   for (uint32_t page = page_first; page <= page_last; ++page) {
-    gpu_used_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+    gpu_last_used_submission_[page] = submission;
   }
   gpu_used_any_ = true;
 }
 
-bool MetalSharedMemory::IsRangeUsedByGpu(uint32_t start,
-                                         uint32_t length) const {
+uint64_t MetalSharedMemory::GetRangeLastGpuUse(uint32_t start,
+                                               uint32_t length) const {
   if (!gpu_used_any_ || !length || start >= kBufferSize) {
-    return false;
+    return 0;
   }
   length = std::min(length, kBufferSize - start);
   uint32_t page_first = start >> page_size_log2();
   uint32_t page_last = (start + length - 1) >> page_size_log2();
+  uint64_t last_use = 0;
   for (uint32_t page = page_first; page <= page_last; ++page) {
-    if (gpu_used_pages_[page >> 6] & (uint64_t(1) << (page & 63))) {
-      return true;
-    }
+    last_use = std::max(last_use, gpu_last_used_submission_[page]);
   }
-  return false;
-}
-
-void MetalSharedMemory::ClearGpuUsedRanges() {
-  std::fill(gpu_used_pages_.begin(), gpu_used_pages_.end(), uint64_t(0));
-  gpu_used_any_ = false;
+  return last_use;
 }
 
 void MetalSharedMemory::ClearCache() { SharedMemory::ClearCache(); }
@@ -177,18 +172,19 @@ bool MetalSharedMemory::UploadRanges(
       return;
     }
     uint32_t length = end - start;
-    if (!use_zero_copy_ && IsRangeUsedByGpu(start, length)) {
-      // Queued draws still have to read the old contents of these pages.
-      static std::atomic<uint32_t> wait_count{0};
-      uint32_t count = ++wait_count;
-      if (count <= 8 || (count % 256) == 0) {
-        XELOGI(
-            "Metal shared memory: waiting for the GPU before overwriting "
-            "{:08X}-{:08X} (#{})",
-            start, end, count);
+    if (!use_zero_copy_) {
+      uint64_t last_use = GetRangeLastGpuUse(start, length);
+      if (last_use &&
+          command_processor_.WaitForGpuBeforeSharedMemoryOverwrite(last_use)) {
+        static std::atomic<uint32_t> wait_count{0};
+        uint32_t count = ++wait_count;
+        if (count <= 8 || (count % 256) == 0) {
+          XELOGI(
+              "Metal shared memory: waited for the GPU before overwriting "
+              "{:08X}-{:08X} (#{})",
+              start, end, count);
+        }
       }
-      command_processor_.WaitForGpuBeforeSharedMemoryOverwrite();
-      ClearGpuUsedRanges();
     }
     MakeRangeValid(start, length, false);
     if (!use_zero_copy_) {

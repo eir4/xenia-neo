@@ -2720,21 +2720,22 @@ void MetalCommandProcessor::AwaitSubmissionCompletion(uint64_t submission) {
   });
 }
 
-void MetalCommandProcessor::WaitForGpuBeforeSharedMemoryOverwrite() {
-  // Nothing queued can still be reading shared memory: no draws are recorded in
-  // the open command buffer and everything submitted has completed.
-  const bool open_has_draws = current_command_buffer_ && current_draw_index_;
-  if (!open_has_draws &&
-      completed_command_buffers_.load(std::memory_order_acquire) >=
-          submission_current_) {
-    return;
+bool MetalCommandProcessor::WaitForGpuBeforeSharedMemoryOverwrite(
+    uint64_t last_use_submission) {
+  if (last_use_submission <=
+      completed_command_buffers_.load(std::memory_order_acquire)) {
+    return false;
   }
-  const bool had_open_command_buffer = current_command_buffer_ != nullptr;
-  AwaitAllQueueOperationsCompletion();
-  if (had_open_command_buffer) {
+  if (current_command_buffer_ && last_use_submission >= submission_current_) {
+    // The draws that read this memory are still only recorded.
+    EndCommandBuffer(CommandBufferKind::kSubmissionWait);
+    AwaitSubmissionCompletion(last_use_submission);
     BeginCommandBuffer();
     shared_memory_wait_replaced_encoder_ = true;
+    return true;
   }
+  AwaitSubmissionCompletion(last_use_submission);
+  return true;
 }
 
 void MetalCommandProcessor::AwaitAllQueueOperationsCompletion() {
@@ -4686,10 +4687,11 @@ bool MetalCommandProcessor::IssueDrawMsl(
   }
 
   if (shared_memory_) {
-    // Record what this draw reads only now, after any wait for the GPU that
-    // its own uploads triggered has already dropped the older tracking.
+    // Recorded only now, against the submission this draw ended up in, since a
+    // wait for the GPU during its uploads can start a new command buffer.
     for (const auto& range : draw_gpu_read_ranges_) {
-      shared_memory_->MarkRangeUsedByGpu(range.first, range.second);
+      shared_memory_->MarkRangeUsedByGpu(range.first, range.second,
+                                         submission_current_);
     }
   }
   ++current_draw_index_;
@@ -5254,10 +5256,11 @@ bool MetalCommandProcessor::IssueDrawDxil(
   }
 
   if (shared_memory_) {
-    // Record what this draw reads only now, after any wait for the GPU that
-    // its own uploads triggered has already dropped the older tracking.
+    // Recorded only now, against the submission this draw ended up in, since a
+    // wait for the GPU during its uploads can start a new command buffer.
     for (const auto& range : draw_gpu_read_ranges_) {
-      shared_memory_->MarkRangeUsedByGpu(range.first, range.second);
+      shared_memory_->MarkRangeUsedByGpu(range.first, range.second,
+                                         submission_current_);
     }
   }
   ++current_draw_index_;

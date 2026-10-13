@@ -52,12 +52,13 @@ class MetalSharedMemory : public SharedMemory {
   void InitializeTraceCompleteDownloads();
 
   // The GPU reads this buffer when it executes a draw, which can be after the
-  // guest has already reused the memory for later data. Draws record the ranges
-  // they read here, and uploads that would overwrite such a range first wait
-  // for the GPU. Only valid without zero-copy aliasing, where the guest can't
-  // modify the buffer directly.
+  // guest has already reused the memory for later data. Draws record the
+  // submission that reads each page here, and uploads that would overwrite
+  // such pages first wait for that submission. Only valid without zero-copy
+  // aliasing, where the guest can't modify the buffer directly.
   bool is_ordering_uploads() const { return !use_zero_copy_; }
-  void MarkRangeUsedByGpu(uint32_t start, uint32_t length);
+  void MarkRangeUsedByGpu(uint32_t start, uint32_t length,
+                          uint64_t submission);
 
  private:
   MetalCommandProcessor& command_processor_;
@@ -65,12 +66,12 @@ class MetalSharedMemory : public SharedMemory {
   MTL::Buffer* buffer_ = nullptr;
   bool use_zero_copy_ = false;
 
-  bool IsRangeUsedByGpu(uint32_t start, uint32_t length) const;
-  void ClearGpuUsedRanges();
+  // The latest submission whose draws read the range, 0 if none did.
+  uint64_t GetRangeLastGpuUse(uint32_t start, uint32_t length) const;
 
-  // One bit per guest page that draws have read since the GPU was last known
-  // to be idle. Only touched from the command processor thread.
-  std::vector<uint64_t> gpu_used_pages_;
+  // Per guest page, the latest submission whose draws read it. Only touched
+  // from the command processor thread.
+  std::vector<uint64_t> gpu_last_used_submission_;
   bool gpu_used_any_ = false;
 };
 
