@@ -2720,6 +2720,22 @@ void MetalCommandProcessor::AwaitSubmissionCompletion(uint64_t submission) {
   });
 }
 
+void MetalCommandProcessor::WaitForGpuBeforeSharedMemoryOverwrite() {
+  // Nothing queued can still be reading shared memory: no draws are recorded in
+  // the open command buffer and everything submitted has completed.
+  const bool open_has_draws = current_command_buffer_ && current_draw_index_;
+  if (!open_has_draws &&
+      completed_command_buffers_.load(std::memory_order_acquire) >=
+          submission_current_) {
+    return;
+  }
+  const bool had_open_command_buffer = current_command_buffer_ != nullptr;
+  AwaitAllQueueOperationsCompletion();
+  if (had_open_command_buffer) {
+    BeginCommandBuffer();
+  }
+}
+
 void MetalCommandProcessor::AwaitAllQueueOperationsCompletion() {
   // Ending first, so a memexport draw that is still only recorded gets
   // submitted rather than waited past.
@@ -3139,6 +3155,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
     const Shader& vertex_shader, const RegisterFile& regs) {
   SCOPE_profile_cpu_f("gpu");
+  draw_gpu_read_ranges_.clear();
   if (!shared_memory_) {
     return true;
   }
@@ -3187,6 +3204,7 @@ bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
             buffer_offset, buffer_length);
         return false;
       }
+      draw_gpu_read_ranges_.emplace_back(buffer_offset, buffer_length);
     }
   }
 
@@ -3199,6 +3217,7 @@ bool MetalCommandProcessor::RequestDrawSharedMemoryRanges(
           base_bytes, memexport_range.size_bytes);
       return false;
     }
+    draw_gpu_read_ranges_.emplace_back(base_bytes, memexport_range.size_bytes);
   }
   return true;
 }
@@ -3486,8 +3505,13 @@ bool MetalCommandProcessor::ResolveDrawIndexBuffer(
         SharedMemory::kBufferSize - index_base < index_length) {
       return false;
     }
-    return shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
-                                        static_cast<uint32_t>(index_length));
+    if (!shared_memory_->RequestRange(static_cast<uint32_t>(index_base),
+                                      static_cast<uint32_t>(index_length))) {
+      return false;
+    }
+    draw_gpu_read_ranges_.emplace_back(static_cast<uint32_t>(index_base),
+                                       static_cast<uint32_t>(index_length));
+    return true;
   };
 
   bool use_expansion_triangle_list_fallback = false;
@@ -4608,6 +4632,13 @@ bool MetalCommandProcessor::IssueDrawMsl(
     NoteMemexportRangesWritten();
   }
 
+  if (shared_memory_) {
+    // Record what this draw reads only now, after any wait for the GPU that
+    // its own uploads triggered has already dropped the older tracking.
+    for (const auto& range : draw_gpu_read_ranges_) {
+      shared_memory_->MarkRangeUsedByGpu(range.first, range.second);
+    }
+  }
   ++current_draw_index_;
   return true;
 }
@@ -5150,6 +5181,13 @@ bool MetalCommandProcessor::IssueDrawDxil(
     NoteMemexportRangesWritten();
   }
 
+  if (shared_memory_) {
+    // Record what this draw reads only now, after any wait for the GPU that
+    // its own uploads triggered has already dropped the older tracking.
+    for (const auto& range : draw_gpu_read_ranges_) {
+      shared_memory_->MarkRangeUsedByGpu(range.first, range.second);
+    }
+  }
   ++current_draw_index_;
   return true;
 }

@@ -9,11 +9,23 @@
 
 #include "xenia/gpu/metal/metal_shared_memory.h"
 
+#include <algorithm>
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/metal/metal_command_processor.h"
+
+DEFINE_bool(
+    metal_ordered_shared_memory_uploads, true,
+    "Keep the Metal shared memory as a separate buffer and wait for the GPU "
+    "before overwriting data that queued draws still have to read, instead of "
+    "aliasing guest memory (shared_memory_zero_copy). Aliasing lets the GPU "
+    "see guest memory rewritten after a draw was issued, which can misplace "
+    "or flicker geometry.",
+    "Metal");
 
 namespace xe {
 namespace gpu {
@@ -50,7 +62,8 @@ bool MetalSharedMemory::Initialize() {
     return false;
   }
 
-  if (cvars::shared_memory_zero_copy) {
+  if (cvars::shared_memory_zero_copy &&
+      !cvars::metal_ordered_shared_memory_uploads) {
     size_t system_page_size = xe::memory::page_size();
     if (reinterpret_cast<uintptr_t>(xbox_ram) % system_page_size == 0) {
       buffer_ = device->newBuffer(xbox_ram, kBufferSize,
@@ -85,7 +98,48 @@ bool MetalSharedMemory::Initialize() {
     XELOGD("Metal shared memory: skipping initial copy (zero-copy)");
   }
 
+  gpu_used_pages_.assign(
+      (size_t(kBufferSize >> page_size_log2()) + 63) / 64, 0);
+  gpu_used_any_ = false;
+  XELOGI("Metal shared memory: {} uploads",
+         use_zero_copy_ ? "zero-copy aliased (unordered)"
+                        : "copied and ordered against queued draws");
+
   return true;
+}
+
+void MetalSharedMemory::MarkRangeUsedByGpu(uint32_t start, uint32_t length) {
+  if (use_zero_copy_ || !length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2();
+  uint32_t page_last = (start + length - 1) >> page_size_log2();
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    gpu_used_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+  }
+  gpu_used_any_ = true;
+}
+
+bool MetalSharedMemory::IsRangeUsedByGpu(uint32_t start,
+                                         uint32_t length) const {
+  if (!gpu_used_any_ || !length || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2();
+  uint32_t page_last = (start + length - 1) >> page_size_log2();
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    if (gpu_used_pages_[page >> 6] & (uint64_t(1) << (page & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void MetalSharedMemory::ClearGpuUsedRanges() {
+  std::fill(gpu_used_pages_.begin(), gpu_used_pages_.end(), uint64_t(0));
+  gpu_used_any_ = false;
 }
 
 void MetalSharedMemory::ClearCache() { SharedMemory::ClearCache(); }
@@ -123,6 +177,19 @@ bool MetalSharedMemory::UploadRanges(
       return;
     }
     uint32_t length = end - start;
+    if (!use_zero_copy_ && IsRangeUsedByGpu(start, length)) {
+      // Queued draws still have to read the old contents of these pages.
+      static std::atomic<uint32_t> wait_count{0};
+      uint32_t count = ++wait_count;
+      if (count <= 8 || (count % 256) == 0) {
+        XELOGI(
+            "Metal shared memory: waiting for the GPU before overwriting "
+            "{:08X}-{:08X} (#{})",
+            start, end, count);
+      }
+      command_processor_.WaitForGpuBeforeSharedMemoryOverwrite();
+      ClearGpuUsedRanges();
+    }
     MakeRangeValid(start, length, false);
     if (!use_zero_copy_) {
       memcpy(buffer_data + start, xbox_data + start, length);

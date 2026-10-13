@@ -68,6 +68,11 @@ class MetalCommandProcessor : public CommandProcessor {
                                  kernel::KernelState* kernel_state);
   ~MetalCommandProcessor();
 
+  // Submits the open command buffer, waits for the GPU to finish everything
+  // queued, and reopens a command buffer if one was open, so shared memory
+  // contents that queued draws read can be overwritten.
+  void WaitForGpuBeforeSharedMemoryOverwrite();
+
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
   void RestoreEdramSnapshot(const void* snapshot) override;
   void InitializeTrace() override;
@@ -899,6 +904,9 @@ class MetalCommandProcessor : public CommandProcessor {
   uint64_t render_passes_total_ = 0;
   uint64_t render_passes_window_start_ = 0;
   uint64_t submission_current_ = 0;
+  // Shared memory ranges the draw being issued reads, recorded in the shared
+  // memory's GPU-use tracking once the draw is encoded.
+  std::vector<std::pair<uint32_t, uint32_t>> draw_gpu_read_ranges_;
   uint64_t submission_completed_processed_ = 0;
   // Signaled by the submission completion handler so waits for a specific
   // submission don't have to poll.

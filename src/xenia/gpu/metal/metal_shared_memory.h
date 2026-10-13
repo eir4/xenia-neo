@@ -13,6 +13,8 @@
 // Metal shared memory attempts bytes-no-copy aliasing on unified-memory
 // devices and falls back to staged uploads when unsupported.
 
+#include <vector>
+
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/ui/metal/metal_api.h"
@@ -49,11 +51,27 @@ class MetalSharedMemory : public SharedMemory {
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
 
+  // The GPU reads this buffer when it executes a draw, which can be after the
+  // guest has already reused the memory for later data. Draws record the ranges
+  // they read here, and uploads that would overwrite such a range first wait
+  // for the GPU. Only valid without zero-copy aliasing, where the guest can't
+  // modify the buffer directly.
+  bool is_ordering_uploads() const { return !use_zero_copy_; }
+  void MarkRangeUsedByGpu(uint32_t start, uint32_t length);
+
  private:
   MetalCommandProcessor& command_processor_;
   TraceWriter& trace_writer_;
   MTL::Buffer* buffer_ = nullptr;
   bool use_zero_copy_ = false;
+
+  bool IsRangeUsedByGpu(uint32_t start, uint32_t length) const;
+  void ClearGpuUsedRanges();
+
+  // One bit per guest page that draws have read since the GPU was last known
+  // to be idle. Only touched from the command processor thread.
+  std::vector<uint64_t> gpu_used_pages_;
+  bool gpu_used_any_ = false;
 };
 
 }  // namespace metal
