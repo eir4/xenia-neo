@@ -67,6 +67,11 @@
 DECLARE_bool(precise_interpolation);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(submit_on_primary_buffer_end);
+DEFINE_int32(
+    metal_perf_log_seconds, 5,
+    "Log a line with frames per second, draw issue time, time blocked waiting "
+    "for the GPU and GPU busy time every this many seconds. 0 to disable.",
+    "Metal");
 DEFINE_bool(
     metal_debug_sync_after_draw, false,
     "Debugging only, extremely slow: submit and wait for the GPU after every "
@@ -2395,6 +2400,37 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   EndZPDFrame();
   ProcessCompletedSubmissions();
 
+  ++perf_window_.frames;
+  if (::cvars::metal_perf_log_seconds > 0) {
+    const auto perf_now = std::chrono::steady_clock::now();
+    if (perf_window_.start.time_since_epoch().count() == 0) {
+      perf_window_.start = perf_now;
+      perf_window_.gpu_busy_ns_start =
+          completed_gpu_time_ns_.load(std::memory_order_relaxed);
+      perf_window_.frames = 0;
+    }
+    const double seconds =
+        std::chrono::duration<double>(perf_now - perf_window_.start).count();
+    if (seconds >= double(::cvars::metal_perf_log_seconds) &&
+        perf_window_.frames) {
+      const double frames = double(perf_window_.frames);
+      const uint64_t gpu_busy_ns =
+          completed_gpu_time_ns_.load(std::memory_order_relaxed);
+      XELOGI(
+          "Metal perf: {:.1f} frames/s, {:.0f} draws/frame, draw issue "
+          "{:.2f} ms/frame, blocked on GPU {:.2f} ms/frame ({:.1f} "
+          "waits/frame), GPU busy {:.2f} ms/frame",
+          frames / seconds, double(perf_window_.draws) / frames,
+          double(perf_window_.draw_issue_ns) / 1e6 / frames,
+          double(perf_window_.gpu_wait_ns) / 1e6 / frames,
+          double(perf_window_.gpu_waits) / frames,
+          double(gpu_busy_ns - perf_window_.gpu_busy_ns_start) / 1e6 / frames);
+      perf_window_ = PerfWindow();
+      perf_window_.start = perf_now;
+      perf_window_.gpu_busy_ns_start = gpu_busy_ns;
+    }
+  }
+
   // Completion handlers land a frame or two behind, which a window this wide
   // absorbs.
   static constexpr uint32_t kGpuTimeWindowFrames = 60;
@@ -2726,15 +2762,21 @@ bool MetalCommandProcessor::WaitForGpuBeforeSharedMemoryOverwrite(
       completed_command_buffers_.load(std::memory_order_acquire)) {
     return false;
   }
+  const auto wait_start = std::chrono::steady_clock::now();
   if (current_command_buffer_ && last_use_submission >= submission_current_) {
     // The draws that read this memory are still only recorded.
     EndCommandBuffer(CommandBufferKind::kSubmissionWait);
     AwaitSubmissionCompletion(last_use_submission);
     BeginCommandBuffer();
     shared_memory_wait_replaced_encoder_ = true;
-    return true;
+  } else {
+    AwaitSubmissionCompletion(last_use_submission);
   }
-  AwaitSubmissionCompletion(last_use_submission);
+  perf_window_.gpu_wait_ns += uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - wait_start)
+          .count());
+  ++perf_window_.gpu_waits;
   return true;
 }
 
@@ -2992,6 +3034,18 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
   SCOPE_profile_cpu_f("gpu");
+  struct PerfScope {
+    PerfWindow& window;
+    std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+    ~PerfScope() {
+      window.draw_issue_ns += uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count());
+      ++window.draws;
+    }
+  } perf_scope{perf_window_};
   const RegisterFile& regs = *register_file_;
   uint32_t normalized_color_mask = 0;
 

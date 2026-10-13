@@ -913,6 +913,19 @@ class MetalCommandProcessor : public CommandProcessor {
   // asks to be issued again.
   bool shared_memory_wait_replaced_encoder_ = false;
   bool draw_needs_retry_ = false;
+
+  // Totals since the last periodic performance log line
+  // (metal_perf_log_seconds).
+  struct PerfWindow {
+    std::chrono::steady_clock::time_point start;
+    uint64_t frames = 0;
+    uint64_t draws = 0;
+    uint64_t draw_issue_ns = 0;
+    uint64_t gpu_waits = 0;
+    uint64_t gpu_wait_ns = 0;
+    uint64_t gpu_busy_ns_start = 0;
+  };
+  PerfWindow perf_window_;
   uint64_t submission_completed_processed_ = 0;
   // Signaled by the submission completion handler so waits for a specific
   // submission don't have to poll.
