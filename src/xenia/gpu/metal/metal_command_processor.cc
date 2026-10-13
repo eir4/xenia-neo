@@ -3758,6 +3758,15 @@ bool MetalCommandProcessor::IssueDrawMsl(
   if (!RequestDrawSharedMemoryRanges(*msl_vertex_shader, regs)) {
     return false;
   }
+  // Uploading the index data can wait for the GPU, which submits the open
+  // command buffer and starts a new encoder. Do it before any encoder state is
+  // set for this draw (the resolve in the draw only repeats a no-op request).
+  {
+    DrawIndexBuffer index_buffer_prefetch;
+    ResolveDrawIndexBuffer(primitive_processing_result,
+                           host_vertex_shader_type, is_tessellated,
+                           index_buffer_prefetch);
+  }
 
   draw_util::ViewportInfo viewport_info;
   ComputeDrawViewportInfo(regs, msl_pixel_shader, normalized_depth_control,
@@ -5061,6 +5070,15 @@ bool MetalCommandProcessor::IssueDrawDxil(
   if (!RequestDrawSharedMemoryRanges(*dxil_vertex_shader, regs)) {
     LogDrawSkip("DXIL: RequestDrawSharedMemoryRanges failed");
     return false;
+  }
+  // Uploading the index data can wait for the GPU, which submits the open
+  // command buffer and starts a new encoder. Do it before any encoder state is
+  // set for this draw (the resolve in the draw only repeats a no-op request).
+  {
+    DrawIndexBuffer index_buffer_prefetch;
+    ResolveDrawIndexBuffer(primitive_processing_result,
+                           host_vertex_shader_type, is_tessellated,
+                           index_buffer_prefetch);
   }
 
   draw_util::ViewportInfo viewport_info;
