@@ -940,6 +940,7 @@ class MetalCommandProcessor : public CommandProcessor {
   bool capture_started_on_start_ = false;
   std::string capture_path_;
   std::unordered_set<uint64_t> capture_shaders_written_;
+  std::unordered_set<uint64_t> capture_blobs_written_;
   uint64_t submission_completed_processed_ = 0;
   // Signaled by the submission completion handler so waits for a specific
   // submission don't have to poll.

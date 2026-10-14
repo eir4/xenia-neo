@@ -27,6 +27,7 @@
 #include <sstream>
 #include <thread>
 
+#include <wx/choice.h>
 #include <wx/timer.h>
 #include <algorithm>
 #include <cmath>
@@ -1177,6 +1178,25 @@ bool EmulatorWindow::Initialize() {
                          _("Capture the next 2 frames (draws, bone matrices, "
                            "vertex data) to Documents/Xenia-neo-Captures"));
         toolbar->EnableTool(kToolIdCapture, false);
+        // Frames per capture; the Capture button records this many.
+        auto* frames_choice = new wxChoice(toolbar, wxID_ANY);
+        static const int kCaptureFrameOptions[] = {1, 2, 4, 6, 10, 30, 60};
+        const int selected = 1;  // 2 frames by default
+        for (size_t i = 0; i < std::size(kCaptureFrameOptions); ++i) {
+          frames_choice->Append(wxString::Format(
+              kCaptureFrameOptions[i] == 1 ? "%d frame" : "%d frames",
+              kCaptureFrameOptions[i]));
+        }
+        frames_choice->SetSelection(selected);
+        gpu::g_draw_capture_frames.store(kCaptureFrameOptions[selected]);
+        frames_choice->SetToolTip(_("Frames recorded per capture"));
+        frames_choice->Bind(wxEVT_CHOICE, [frames_choice](wxCommandEvent&) {
+          int sel = frames_choice->GetSelection();
+          if (sel >= 0 && sel < static_cast<int>(std::size(kCaptureFrameOptions))) {
+            gpu::g_draw_capture_frames.store(kCaptureFrameOptions[sel]);
+          }
+        });
+        toolbar->AddControl(frames_choice);
       }
       wx_toolbar_state_->audio_no_bundle = load_bundle(
           ui::embedded_icons::icons8_no_audio_96_png_data,

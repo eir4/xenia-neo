@@ -2456,16 +2456,19 @@ void MetalCommandProcessor::CaptureUpdateOnSwap() {
   std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &now_tm);
   std::error_code ec;
   capture_path_ = (root / stamp).string();
-  std::filesystem::create_directories(capture_path_, ec);
+  std::filesystem::create_directories(capture_path_ + "/blobs", ec);
   if (ec) {
     XELOGE("Metal capture: could not create {}: {}", capture_path_,
            ec.message());
     return;
   }
-  capture_frames_left_ = std::max(1, ::cvars::metal_capture_frames);
+  const int32_t requested_frames = g_draw_capture_frames.load();
+  capture_frames_left_ = std::max(
+      1, requested_frames > 0 ? requested_frames : ::cvars::metal_capture_frames);
   capture_frame_ = 0;
   capture_draw_ = 0;
   capture_shaders_written_.clear();
+  capture_blobs_written_.clear();
   XELOGI("Metal capture: recording {} frame(s) to {}", capture_frames_left_,
          capture_path_);
 }
@@ -2481,6 +2484,17 @@ void MetalCommandProcessor::CaptureDraw(
   const std::string base =
       fmt::format("{}/f{}_d{:05}", capture_path_, capture_frame_, capture_draw_);
   ++capture_draw_;
+
+  // Buffers are written once per capture under blobs/, named by content hash;
+  // the JSON refers to them by file name.
+  auto write_blob = [&](const void* data, size_t size) -> std::string {
+    uint64_t hash = XXH3_64bits(data, size);
+    std::string name = fmt::format("blobs/{:016X}_{}.bin", hash, size);
+    if (capture_blobs_written_.insert(hash ^ (uint64_t(size) << 1)).second) {
+      CaptureWriteFile(capture_path_ + "/" + name, data, size);
+    }
+    return name;
+  };
 
   // Shader microcode and disassembly, once per shader.
   auto write_shader = [&](const Shader& shader) {
@@ -2504,8 +2518,7 @@ void MetalCommandProcessor::CaptureDraw(
   const Shader::ConstantRegisterMap& cmap = vertex_shader.constant_register_map();
 
   // Vertex shader float constants (bone matrices etc.), 256 vec4.
-  CaptureWriteFile(
-      base + "_vsconst.bin",
+  const std::string vsconst_file = write_blob(
       &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 256 * 4 * sizeof(float));
 
   std::string json = "{\n";
@@ -2516,6 +2529,7 @@ void MetalCommandProcessor::CaptureDraw(
   json += fmt::format("  \"vs_hash\": \"{:016X}\",\n", vertex_shader.ucode_data_hash());
   json += fmt::format("  \"ps_hash\": \"{:016X}\",\n",
                       pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+  json += fmt::format("  \"vs_constants_file\": \"{}\",\n", vsconst_file);
   json += fmt::format("  \"vs_float_dynamic_addressing\": {},\n",
                       cmap.float_dynamic_addressing ? "true" : "false");
   json += fmt::format("  \"vs_float_count\": {},\n", cmap.float_count);
@@ -2543,20 +2557,21 @@ void MetalCommandProcessor::CaptureDraw(
       uint32_t offset = xenos::CpuToGpu(vfetch.address << 2);
       uint32_t length = vfetch.size << 2;
       bool dumped = false;
+      std::string file;
       if (length && length <= 64u * 1024 * 1024 &&
           offset <= SharedMemory::kBufferSize &&
           SharedMemory::kBufferSize - offset >= length) {
         const uint8_t* src = memory_->TranslatePhysical(offset);
         if (src) {
-          CaptureWriteFile(fmt::format("{}_vb{}.bin", base, index), src, length);
+          file = write_blob(src, length);
           dumped = true;
         }
       }
       json += fmt::format(
           "{}\n    {{\"index\": {}, \"address\": {}, \"size_bytes\": {}, "
-          "\"endian\": {}, \"dumped\": {}}}",
+          "\"endian\": {}, \"dumped\": {}, \"file\": \"{}\"}}",
           first ? "" : ",", index, offset, length, uint32_t(vfetch.endian),
-          dumped ? "true" : "false");
+          dumped ? "true" : "false", file);
       first = false;
     }
   }
@@ -2567,19 +2582,21 @@ void MetalCommandProcessor::CaptureDraw(
     uint32_t offset = index_buffer_info->guest_base;
     size_t length = index_buffer_info->length;
     bool dumped = false;
+    std::string ib_file;
     if (length <= 64u * 1024 * 1024 && offset <= SharedMemory::kBufferSize &&
         SharedMemory::kBufferSize - offset >= length) {
       const uint8_t* src = memory_->TranslatePhysical(offset);
       if (src) {
-        CaptureWriteFile(base + "_ib.bin", src, length);
+        ib_file = write_blob(src, length);
         dumped = true;
       }
     }
     json += fmt::format(
         "  \"index_buffer\": {{\"address\": {}, \"size_bytes\": {}, "
-        "\"format\": {}, \"endian\": {}, \"dumped\": {}}},\n",
+        "\"format\": {}, \"endian\": {}, \"dumped\": {}, \"file\": \"{}\"}},\n",
         offset, length, uint32_t(index_buffer_info->format),
-        uint32_t(index_buffer_info->endianness), dumped ? "true" : "false");
+        uint32_t(index_buffer_info->endianness), dumped ? "true" : "false",
+        ib_file);
   } else {
     json += "  \"index_buffer\": null,\n";
   }

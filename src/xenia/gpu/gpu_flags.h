@@ -98,6 +98,8 @@ namespace xe {
 namespace gpu {
 // Set by the UI (toolbar Capture button) to record the next frames' draws.
 extern std::atomic<bool> g_draw_capture_requested;
+// Frames per capture chosen in the UI; 0 uses --metal_capture_frames.
+extern std::atomic<int32_t> g_draw_capture_frames;
 }  // namespace gpu
 }  // namespace xe
 

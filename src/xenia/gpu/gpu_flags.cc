@@ -16,6 +16,7 @@
 namespace xe {
 namespace gpu {
 std::atomic<bool> g_draw_capture_requested{false};
+std::atomic<int32_t> g_draw_capture_frames{0};
 }  // namespace gpu
 }  // namespace xe
 
